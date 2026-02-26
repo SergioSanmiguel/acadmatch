@@ -64,6 +64,12 @@ model User {
   messages    Message[]
   favorites   Favorite[] @relation("FavoriteUser")
   favoritedBy Favorite[] @relation("FavoritedUser")
+  blocksSent  Block[]   @relation("Blocker")
+  blocksRecvd Block[]   @relation("Blocked")
+
+  @@index([mainField])
+  @@index([country])
+  @@index([profileComplete])
 }
 
 model VerificationToken {
@@ -92,19 +98,28 @@ model Swipe {
   @@unique([fromUserId, toUserId])
   @@index([fromUserId])
   @@index([toUserId])
+  @@index([fromUserId, type])
+}
+
+enum MatchStatus {
+  ACTIVE
+  BLOCKED
+  ARCHIVED
 }
 
 model Match {
-  id        String   @id @default(cuid())
+  id        String      @id @default(cuid())
   user1Id   String
   user2Id   String
-  createdAt DateTime @default(now())
+  status    MatchStatus @default(ACTIVE)
+  createdAt DateTime    @default(now())
 
   user1    User      @relation("MatchUser1", fields: [user1Id], references: [id], onDelete: Cascade)
   user2    User      @relation("MatchUser2", fields: [user2Id], references: [id], onDelete: Cascade)
   messages Message[]
 
   @@unique([user1Id, user2Id])
+  @@index([user1Id, user2Id])
   @@index([user1Id])
   @@index([user2Id])
 }
@@ -120,6 +135,7 @@ model Message {
   sender User  @relation(fields: [senderId], references: [id], onDelete: Cascade)
 
   @@index([matchId])
+  @@index([matchId, createdAt])
   @@index([senderId])
 }
 
@@ -134,4 +150,17 @@ model Favorite {
 
   @@unique([userId, favoritedId])
   @@index([userId])
+}
+
+model Block {
+  id        String   @id @default(cuid())
+  blockerId String
+  blockedId String
+  createdAt DateTime @default(now())
+
+  blocker User @relation("Blocker", fields: [blockerId], references: [id], onDelete: Cascade)
+  blocked User @relation("Blocked", fields: [blockedId], references: [id], onDelete: Cascade)
+
+  @@unique([blockerId, blockedId])
+  @@index([blockerId])
 }
