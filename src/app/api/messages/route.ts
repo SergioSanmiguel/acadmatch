@@ -4,6 +4,7 @@ import { authOptions } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
 import { messageSchema } from '@/lib/validations';
 import { sanitizeString } from '@/lib/utils';
+import { enforceRateLimit } from '@/lib/security';
 
 export async function GET(req: NextRequest) {
   const session = await getServerSession(authOptions);
@@ -14,10 +15,10 @@ export async function GET(req: NextRequest) {
   const matchId = req.nextUrl.searchParams.get('matchId');
   if (!matchId) return NextResponse.json({ error: 'matchId required' }, { status: 400 });
 
-  // Verify user is part of this match
   const match = await prisma.match.findFirst({
     where: {
       id: matchId,
+      status: 'ACTIVE',
       OR: [{ user1Id: session.user.id }, { user2Id: session.user.id }],
     },
   });
@@ -41,6 +42,16 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
+  const rateLimit = enforceRateLimit({
+    key: `message:${session.user.id}`,
+    limit: 40,
+    windowMs: 60_000,
+  });
+
+  if (!rateLimit.allowed) {
+    return NextResponse.json({ error: 'Too many messages sent. Please wait.' }, { status: 429, headers: { 'Retry-After': String(rateLimit.retryAfterSec ?? 60) } });
+  }
+
   const body = await req.json();
   const parsed = messageSchema.safeParse(body);
   if (!parsed.success) {
@@ -49,10 +60,10 @@ export async function POST(req: NextRequest) {
 
   const { matchId, content } = parsed.data;
 
-  // Verify user is part of this match
   const match = await prisma.match.findFirst({
     where: {
       id: matchId,
+      status: 'ACTIVE',
       OR: [{ user1Id: session.user.id }, { user2Id: session.user.id }],
     },
   });

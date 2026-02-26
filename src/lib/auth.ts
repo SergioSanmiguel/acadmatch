@@ -32,14 +32,25 @@ export const authOptions: NextAuthOptions = {
       }
       return true;
     },
-    async session({ session, user }) {
-      if (session.user) {
-        session.user.id = user.id;
+    async jwt({ token, user, trigger }) {
+      if (user?.id) {
+        token.id = user.id;
+      }
+
+      if (token.id && (!('profileComplete' in token) || trigger === 'update')) {
         const dbUser = await prisma.user.findUnique({
-          where: { id: user.id },
-          select: { profileComplete: true, mainField: true, university: true },
+          where: { id: token.id as string },
+          select: { profileComplete: true },
         });
-        (session.user as any).profileComplete = dbUser?.profileComplete ?? false;
+        token.profileComplete = dbUser?.profileComplete ?? false;
+      }
+
+      return token;
+    },
+    async session({ session, token }) {
+      if (session.user) {
+        session.user.id = token.id as string;
+        session.user.profileComplete = Boolean(token.profileComplete);
       }
       return session;
     },
@@ -48,5 +59,5 @@ export const authOptions: NextAuthOptions = {
     signIn: '/auth/signin',
     error: '/auth/error',
   },
-  session: { strategy: 'database' },
+  session: { strategy: 'jwt' },
 };

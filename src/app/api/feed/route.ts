@@ -4,6 +4,7 @@ import { authOptions } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
 import { filtersSchema } from '@/lib/validations';
 import { sortByCompatibility } from '@/lib/recommendation';
+import { getBlockedUserIds } from '@/lib/security';
 
 export async function GET(req: NextRequest) {
   const session = await getServerSession(authOptions);
@@ -19,26 +20,31 @@ export async function GET(req: NextRequest) {
     collaborationInterest: searchParams.get('collaborationInterest') || undefined,
   });
 
-  // Get already swiped user IDs
-  const swipedIds = await prisma.swipe.findMany({
-    where: { fromUserId: session.user.id },
-    select: { toUserId: true },
-  });
-  const excludeIds = [session.user.id, ...swipedIds.map((s) => s.toUserId)];
+  if (!filters.success) {
+    return NextResponse.json({ error: filters.error.flatten() }, { status: 400 });
+  }
+
+  const [swipedIds, blockedIds] = await Promise.all([
+    prisma.swipe.findMany({
+      where: { fromUserId: session.user.id },
+      select: { toUserId: true },
+    }),
+    getBlockedUserIds(session.user.id),
+  ]);
+
+  const excludeIds = [session.user.id, ...blockedIds, ...swipedIds.map((s) => s.toUserId)];
 
   const whereClause: any = {
     id: { notIn: excludeIds },
     profileComplete: true,
   };
 
-  if (filters.success && filters.data) {
-    const { country, university, mainField, collaborationInterest } = filters.data;
-    if (country) whereClause.country = { contains: country, mode: 'insensitive' };
-    if (university) whereClause.university = { contains: university, mode: 'insensitive' };
-    if (mainField) whereClause.mainField = { contains: mainField, mode: 'insensitive' };
-    if (collaborationInterest) {
-      whereClause.collaborationInterests = { has: collaborationInterest };
-    }
+  const { country, university, mainField, collaborationInterest } = filters.data;
+  if (country) whereClause.country = { contains: country, mode: 'insensitive' };
+  if (university) whereClause.university = { contains: university, mode: 'insensitive' };
+  if (mainField) whereClause.mainField = { contains: mainField, mode: 'insensitive' };
+  if (collaborationInterest) {
+    whereClause.collaborationInterests = { has: collaborationInterest };
   }
 
   const candidates = await prisma.user.findMany({
@@ -52,7 +58,6 @@ export async function GET(req: NextRequest) {
     },
   });
 
-  // Get current user for recommendation
   const currentUser = await prisma.user.findUnique({
     where: { id: session.user.id },
     select: { mainField: true, secondaryFields: true, collaborationInterests: true },
