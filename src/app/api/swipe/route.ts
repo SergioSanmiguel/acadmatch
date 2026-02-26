@@ -7,42 +7,75 @@ import { enforceRateLimit } from '@/lib/security';
 
 export async function POST(req: NextRequest) {
   const session = await getServerSession(authOptions);
+
   if (!session?.user?.id) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
+  const fromUserId = session.user.id;
+
   const rateLimit = enforceRateLimit({
-    key: `swipe:${session.user.id}`,
+    key: `swipe:${fromUserId}`,
     limit: 120,
     windowMs: 60_000,
   });
 
   if (!rateLimit.allowed) {
-    return NextResponse.json({ error: 'Too many swipe requests' }, { status: 429, headers: { 'Retry-After': String(rateLimit.retryAfterSec ?? 60) } });
+    return NextResponse.json(
+      { error: 'Too many swipe requests' },
+      {
+        status: 429,
+        headers: { 'Retry-After': String(rateLimit.retryAfterSec ?? 60) },
+      }
+    );
   }
 
   const body = await req.json();
   const parsed = swipeSchema.safeParse(body);
+
   if (!parsed.success) {
-    return NextResponse.json({ error: parsed.error.flatten() }, { status: 400 });
+    return NextResponse.json(
+      { error: parsed.error.flatten() },
+      { status: 400 }
+    );
   }
 
   const { toUserId, type } = parsed.data;
-  const fromUserId = session.user.id;
 
   if (fromUserId === toUserId) {
-    return NextResponse.json({ error: 'Cannot swipe yourself' }, { status: 400 });
+    return NextResponse.json(
+      { error: 'Cannot swipe yourself' },
+      { status: 400 }
+    );
   }
 
+  // Verificar que el usuario actual tenga perfil completo
+  const currentUser = await prisma.user.findUnique({
+    where: { id: fromUserId },
+    select: { profileComplete: true },
+  });
+
+  if (!currentUser?.profileComplete) {
+    return NextResponse.json(
+      { error: 'Complete your profile before swiping' },
+      { status: 403 }
+    );
+  }
+
+  // Verificar que el usuario objetivo exista y esté disponible
   const target = await prisma.user.findUnique({
     where: { id: toUserId },
     select: { id: true, profileComplete: true },
   });
 
   if (!target?.profileComplete) {
-    return NextResponse.json({ error: 'Target user is not available' }, { status: 404 });
+    return NextResponse.json(
+      { error: 'Target user is not available' },
+      { status: 404 }
+    );
   }
 
+  // Verificar bloqueos en ambos sentidos
   const existingBlock = await prisma.block.findFirst({
     where: {
       OR: [
@@ -54,31 +87,73 @@ export async function POST(req: NextRequest) {
   });
 
   if (existingBlock) {
-    return NextResponse.json({ error: 'Cannot interact with this user' }, { status: 403 });
+    return NextResponse.json(
+      { error: 'Cannot interact with this user' },
+      { status: 403 }
+    );
   }
 
-  const swipe = await prisma.swipe.upsert({
-    where: { fromUserId_toUserId: { fromUserId, toUserId } },
-    update: { type },
-    create: { fromUserId, toUserId, type },
-  });
+  let createdMatch = null;
 
-  let match = null;
-
-  if (type === 'LIKE') {
-    const reciprocalLike = await prisma.swipe.findFirst({
-      where: { fromUserId: toUserId, toUserId: fromUserId, type: 'LIKE' },
+  const result = await prisma.$transaction(async (tx) => {
+    // Crear o actualizar swipe
+    const swipe = await tx.swipe.upsert({
+      where: {
+        fromUserId_toUserId: { fromUserId, toUserId },
+      },
+      update: { type },
+      create: { fromUserId, toUserId, type },
     });
 
-    if (reciprocalLike) {
-      const [user1Id, user2Id] = [fromUserId, toUserId].sort();
-      match = await prisma.match.upsert({
-        where: { user1Id_user2Id: { user1Id, user2Id } },
-        update: {},
-        create: { user1Id, user2Id },
-      });
+    // Solo procesar match si es LIKE
+    if (type !== 'LIKE') {
+      return { swipe, match: null };
     }
-  }
 
-  return NextResponse.json({ swipe, match, isMatch: !!match });
+    // Verificar reciprocidad
+    const reciprocalLike = await tx.swipe.findFirst({
+      where: {
+        fromUserId: toUserId,
+        toUserId: fromUserId,
+        type: 'LIKE',
+      },
+      select: { id: true },
+    });
+
+    if (!reciprocalLike) {
+      return { swipe, match: null };
+    }
+
+    // Ordenar IDs para evitar duplicados invertidos
+    const [user1Id, user2Id] =
+      fromUserId < toUserId
+        ? [fromUserId, toUserId]
+        : [toUserId, fromUserId];
+
+    // Verificar si ya existe match
+    const existingMatch = await tx.match.findUnique({
+      where: {
+        user1Id_user2Id: { user1Id, user2Id },
+      },
+    });
+
+    if (existingMatch) {
+      return { swipe, match: existingMatch };
+    }
+
+    // Crear match
+    const match = await tx.match.create({
+      data: { user1Id, user2Id },
+    });
+
+    return { swipe, match };
+  });
+
+  createdMatch = result.match;
+
+  return NextResponse.json({
+    swipe: result.swipe,
+    match: createdMatch,
+    isMatch: !!createdMatch,
+  });
 }

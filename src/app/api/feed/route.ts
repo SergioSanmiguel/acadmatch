@@ -8,41 +8,84 @@ import { getBlockedUserIds } from '@/lib/security';
 
 export async function GET(req: NextRequest) {
   const session = await getServerSession(authOptions);
+
   if (!session?.user?.id) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
+  const userId = session.user.id;
+
+  const currentUser = await prisma.user.findUnique({
+    where: { id: userId },
+    select: {
+      profileComplete: true,
+      mainField: true,
+      secondaryFields: true,
+      collaborationInterests: true,
+    },
+  });
+
+  if (!currentUser?.profileComplete) {
+    return NextResponse.json(
+      { error: 'Complete your profile first' },
+      { status: 403 }
+    );
+  }
+
   const { searchParams } = new URL(req.url);
+
   const filters = filtersSchema.safeParse({
     country: searchParams.get('country') || undefined,
     university: searchParams.get('university') || undefined,
     mainField: searchParams.get('mainField') || undefined,
-    collaborationInterest: searchParams.get('collaborationInterest') || undefined,
+    collaborationInterest:
+      searchParams.get('collaborationInterest') || undefined,
   });
 
   if (!filters.success) {
-    return NextResponse.json({ error: filters.error.flatten() }, { status: 400 });
+    return NextResponse.json(
+      { error: filters.error.flatten() },
+      { status: 400 }
+    );
   }
 
-  const [swipedIds, blockedIds] = await Promise.all([
+  const cursor = searchParams.get('cursor') || undefined;
+
+  // Limitar swipes recientes para evitar NOT IN gigante
+  const [swipedIdsRaw, blockedIds] = await Promise.all([
     prisma.swipe.findMany({
-      where: { fromUserId: session.user.id },
+      where: { fromUserId: userId },
       select: { toUserId: true },
+      take: 1000, // límite razonable
+      orderBy: { createdAt: 'desc' },
     }),
-    getBlockedUserIds(session.user.id),
+    getBlockedUserIds(userId),
   ]);
 
-  const excludeIds = [session.user.id, ...blockedIds, ...swipedIds.map((s) => s.toUserId)];
+  const swipedIds = swipedIdsRaw.map((s) => s.toUserId);
+
+  const excludeIds = [userId, ...blockedIds, ...swipedIds];
 
   const whereClause: any = {
     id: { notIn: excludeIds },
     profileComplete: true,
   };
 
-  const { country, university, mainField, collaborationInterest } = filters.data;
-  if (country) whereClause.country = { contains: country, mode: 'insensitive' };
-  if (university) whereClause.university = { contains: university, mode: 'insensitive' };
-  if (mainField) whereClause.mainField = { contains: mainField, mode: 'insensitive' };
+  const { country, university, mainField, collaborationInterest } =
+    filters.data;
+
+  if (country) {
+    whereClause.country = { equals: country, mode: 'insensitive' };
+  }
+
+  if (university) {
+    whereClause.university = { contains: university, mode: 'insensitive' };
+  }
+
+  if (mainField) {
+    whereClause.mainField = { equals: mainField, mode: 'insensitive' };
+  }
+
   if (collaborationInterest) {
     whereClause.collaborationInterests = { has: collaborationInterest };
   }
@@ -50,20 +93,33 @@ export async function GET(req: NextRequest) {
   const candidates = await prisma.user.findMany({
     where: whereClause,
     take: 50,
+    ...(cursor && { skip: 1, cursor: { id: cursor } }),
+    orderBy: { createdAt: 'desc' },
     select: {
-      id: true, name: true, image: true, university: true, country: true,
-      mainField: true, secondaryFields: true, researchLines: true, bio: true,
-      orcidUrl: true, googleScholarUrl: true, personalWebsite: true,
-      researchGateUrl: true, collaborationInterests: true, createdAt: true,
+      id: true,
+      name: true,
+      image: true,
+      university: true,
+      country: true,
+      mainField: true,
+      secondaryFields: true,
+      researchLines: true,
+      bio: true,
+      orcidUrl: true,
+      googleScholarUrl: true,
+      personalWebsite: true,
+      researchGateUrl: true,
+      collaborationInterests: true,
+      createdAt: true,
     },
   });
 
-  const currentUser = await prisma.user.findUnique({
-    where: { id: session.user.id },
-    select: { mainField: true, secondaryFields: true, collaborationInterests: true },
+  const sorted = sortByCompatibility(currentUser, candidates);
+
+  return NextResponse.json({
+    data: sorted,
+    nextCursor: candidates.length
+      ? candidates[candidates.length - 1].id
+      : null,
   });
-
-  const sorted = currentUser ? sortByCompatibility(currentUser, candidates) : candidates;
-
-  return NextResponse.json(sorted);
 }

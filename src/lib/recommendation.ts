@@ -1,6 +1,5 @@
 import { User } from '@prisma/client';
 
-// Fields that are complementary (different but likely to collaborate)
 const COMPLEMENTARY_FIELDS: Record<string, string[]> = {
   'Computer Science': ['Biology', 'Medicine', 'Psychology', 'Linguistics', 'Economics', 'Physics'],
   'Biology': ['Computer Science', 'Chemistry', 'Mathematics', 'Engineering', 'Medicine'],
@@ -14,6 +13,17 @@ const COMPLEMENTARY_FIELDS: Record<string, string[]> = {
   'Sociology': ['Psychology', 'Economics', 'Political Science', 'Statistics', 'Computer Science'],
 };
 
+function jaccardSimilarity(a: string[] = [], b: string[] = []) {
+  const setA = new Set(a);
+  const setB = new Set(b);
+
+  const intersection = [...setA].filter((x) => setB.has(x)).length;
+  const union = new Set([...setA, ...setB]).size;
+
+  if (union === 0) return 0;
+  return intersection / union;
+}
+
 export function calculateCompatibilityScore(
   currentUser: Partial<User>,
   candidateUser: Partial<User>
@@ -23,35 +33,50 @@ export function calculateCompatibilityScore(
   const currentField = currentUser.mainField;
   const candidateField = candidateUser.mainField;
 
-  if (!currentField || !candidateField) return 50;
+  if (!currentField || !candidateField) return 40;
 
-  // Base: complementary fields get higher score
+  // 1️⃣ Complementarity
   const complementaryFields = COMPLEMENTARY_FIELDS[currentField] || [];
   if (complementaryFields.includes(candidateField)) {
-    score += 40;
+    score += 35;
   } else if (currentField === candidateField) {
-    // Same field: lower complementarity score but still possible
-    score += 20;
+    score += 15; // same field less valuable than complementary
   }
 
-  // Shared collaboration interests
-  const currentInterests = currentUser.collaborationInterests || [];
-  const candidateInterests = candidateUser.collaborationInterests || [];
-  const sharedInterests = currentInterests.filter((i) => candidateInterests.includes(i));
-  score += sharedInterests.length * 10;
+  // 2️⃣ Collaboration interest similarity (Jaccard weighted)
+  const interestSimilarity = jaccardSimilarity(
+    currentUser.collaborationInterests,
+    candidateUser.collaborationInterests
+  );
+  score += interestSimilarity * 30;
 
-  // Shared secondary fields (overlap = interdisciplinary potential)
-  const currentSecondary = currentUser.secondaryFields || [];
-  const candidateSecondary = candidateUser.secondaryFields || [];
-  const sharedSecondary = currentSecondary.filter((f) => candidateSecondary.includes(f));
-  score += sharedSecondary.length * 5;
+  // 3️⃣ Secondary field interdisciplinarity
+  const secondarySimilarity = jaccardSimilarity(
+    currentUser.secondaryFields,
+    candidateUser.secondaryFields
+  );
+  score += secondarySimilarity * 15;
 
-  // Profile completeness bonus
-  if (candidateUser.bio) score += 5;
-  if (candidateUser.googleScholarUrl) score += 5;
-  if (candidateUser.orcidUrl) score += 5;
+  // 4️⃣ Profile strength bonus
+  let profileStrength = 0;
+  if (candidateUser.bio) profileStrength += 1;
+  if (candidateUser.googleScholarUrl) profileStrength += 1;
+  if (candidateUser.orcidUrl) profileStrength += 1;
+  if (candidateUser.researchGateUrl) profileStrength += 1;
 
-  return Math.min(score, 100);
+  score += profileStrength * 3;
+
+  // 5️⃣ Recency boost (new users slight priority)
+  if (candidateUser.createdAt) {
+    const daysOld =
+      (Date.now() - new Date(candidateUser.createdAt).getTime()) /
+      (1000 * 60 * 60 * 24);
+    if (daysOld < 14) {
+      score += 5;
+    }
+  }
+
+  return Math.min(Math.round(score), 100);
 }
 
 export function sortByCompatibility<T extends Partial<User>>(

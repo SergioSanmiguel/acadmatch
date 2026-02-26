@@ -8,36 +8,55 @@ import { enforceRateLimit } from '@/lib/security';
 
 export async function GET(req: NextRequest) {
   const session = await getServerSession(authOptions);
+
   if (!session?.user?.id) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
   const matchId = req.nextUrl.searchParams.get('matchId');
-  if (!matchId) return NextResponse.json({ error: 'matchId required' }, { status: 400 });
+  const cursor = req.nextUrl.searchParams.get('cursor');
+
+  if (!matchId) {
+    return NextResponse.json({ error: 'matchId required' }, { status: 400 });
+  }
 
   const match = await prisma.match.findFirst({
     where: {
       id: matchId,
       status: 'ACTIVE',
-      OR: [{ user1Id: session.user.id }, { user2Id: session.user.id }],
+      OR: [
+        { user1Id: session.user.id },
+        { user2Id: session.user.id },
+      ],
     },
+    select: { id: true },
   });
 
-  if (!match) return NextResponse.json({ error: 'Not found' }, { status: 404 });
+  if (!match) {
+    return NextResponse.json({ error: 'Not authorized' }, { status: 403 });
+  }
 
   const messages = await prisma.message.findMany({
     where: { matchId },
+    take: 50,
+    ...(cursor && { skip: 1, cursor: { id: cursor } }),
+    orderBy: { createdAt: 'desc' }, // traer últimos primero
     include: {
       sender: { select: { id: true, name: true, image: true } },
     },
-    orderBy: { createdAt: 'asc' },
   });
 
-  return NextResponse.json(messages);
+  return NextResponse.json({
+    data: messages.reverse(), // devolver en orden cronológico
+    nextCursor: messages.length
+      ? messages[messages.length - 1].id
+      : null,
+  });
 }
 
 export async function POST(req: NextRequest) {
   const session = await getServerSession(authOptions);
+
   if (!session?.user?.id) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
@@ -49,13 +68,23 @@ export async function POST(req: NextRequest) {
   });
 
   if (!rateLimit.allowed) {
-    return NextResponse.json({ error: 'Too many messages sent. Please wait.' }, { status: 429, headers: { 'Retry-After': String(rateLimit.retryAfterSec ?? 60) } });
+    return NextResponse.json(
+      { error: 'Too many messages sent. Please wait.' },
+      {
+        status: 429,
+        headers: { 'Retry-After': String(rateLimit.retryAfterSec ?? 60) },
+      }
+    );
   }
 
   const body = await req.json();
   const parsed = messageSchema.safeParse(body);
+
   if (!parsed.success) {
-    return NextResponse.json({ error: parsed.error.flatten() }, { status: 400 });
+    return NextResponse.json(
+      { error: parsed.error.flatten() },
+      { status: 400 }
+    );
   }
 
   const { matchId, content } = parsed.data;
@@ -64,17 +93,36 @@ export async function POST(req: NextRequest) {
     where: {
       id: matchId,
       status: 'ACTIVE',
-      OR: [{ user1Id: session.user.id }, { user2Id: session.user.id }],
+      OR: [
+        { user1Id: session.user.id },
+        { user2Id: session.user.id },
+      ],
     },
+    select: { id: true },
   });
 
-  if (!match) return NextResponse.json({ error: 'Not authorized for this match' }, { status: 403 });
+  if (!match) {
+    return NextResponse.json(
+      { error: 'Not authorized for this match' },
+      { status: 403 }
+    );
+  }
+
+  // Sanitizar y limitar longitud final
+  const cleanContent = sanitizeString(content).slice(0, 1000);
+
+  if (!cleanContent.trim()) {
+    return NextResponse.json(
+      { error: 'Message cannot be empty' },
+      { status: 400 }
+    );
+  }
 
   const message = await prisma.message.create({
     data: {
       matchId,
       senderId: session.user.id,
-      content: sanitizeString(content),
+      content: cleanContent,
     },
     include: {
       sender: { select: { id: true, name: true, image: true } },
