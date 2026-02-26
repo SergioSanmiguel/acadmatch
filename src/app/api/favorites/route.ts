@@ -41,6 +41,29 @@ export async function POST(req: NextRequest) {
   const { favoritedId } = parsed.data;
   if (favoritedId === session.user.id) return NextResponse.json({ error: 'Cannot favorite yourself' }, { status: 400 });
 
+  const target = await prisma.user.findUnique({
+    where: { id: favoritedId },
+    select: { id: true, profileComplete: true },
+  });
+
+  if (!target?.profileComplete) {
+    return NextResponse.json({ error: 'Target user is not available' }, { status: 404 });
+  }
+
+  const existingBlock = await prisma.block.findFirst({
+    where: {
+      OR: [
+        { blockerId: session.user.id, blockedId: favoritedId },
+        { blockerId: favoritedId, blockedId: session.user.id },
+      ],
+    },
+    select: { id: true },
+  });
+
+  if (existingBlock) {
+    return NextResponse.json({ error: 'Cannot interact with this user' }, { status: 403 });
+  }
+
   const existing = await prisma.favorite.findUnique({
     where: { userId_favoritedId: { userId: session.user.id, favoritedId } },
   });
