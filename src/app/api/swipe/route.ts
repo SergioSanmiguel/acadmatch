@@ -1,18 +1,45 @@
-import { NextRequest, NextResponse } from 'next/server';
-import { getServerSession } from 'next-auth';
-import { authOptions } from '@/lib/auth';
-import { prisma } from '@/lib/prisma';
-import { swipeSchema } from '@/lib/validations';
-import { enforceRateLimit } from '@/lib/security';
+import { NextRequest, NextResponse } from "next/server";
+import { getServerSession } from "next-auth";
+
+import { authOptions } from "@/lib/auth";
+import { prisma } from "@/lib/prisma";
+import { swipeSchema } from "@/lib/validations";
+import { enforceRateLimit } from "@/lib/security";
 
 export async function POST(req: NextRequest) {
+  /* ===============================
+     AUTH
+  =============================== */
+
   const session = await getServerSession(authOptions);
 
-  if (!session?.user?.id) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  if (!session?.user?.email) {
+    return NextResponse.json(
+      { error: "Unauthorized" },
+      { status: 401 }
+    );
   }
 
-  const fromUserId = session.user.id;
+  const dbUser = await prisma.user.findUnique({
+    where: { email: session.user.email },
+    select: {
+      id: true,
+      profileComplete: true,
+    },
+  });
+
+  if (!dbUser) {
+    return NextResponse.json(
+      { error: "User not found" },
+      { status: 404 }
+    );
+  }
+
+  const fromUserId = dbUser.id;
+
+  /* ===============================
+     RATE LIMIT
+  =============================== */
 
   const rateLimit = enforceRateLimit({
     key: `swipe:${fromUserId}`,
@@ -22,13 +49,39 @@ export async function POST(req: NextRequest) {
 
   if (!rateLimit.allowed) {
     return NextResponse.json(
-      { error: 'Too many swipe requests' },
+      { error: "Too many swipe requests" },
       {
         status: 429,
-        headers: { 'Retry-After': String(rateLimit.retryAfterSec ?? 60) },
+        headers: {
+          "Retry-After": String(rateLimit.retryAfterSec ?? 60),
+        },
       }
     );
   }
+
+  /* ===============================
+     ANTI BOT BURST
+  =============================== */
+
+  const recentSwipes = await prisma.swipe.count({
+    where: {
+      fromUserId,
+      createdAt: {
+        gte: new Date(Date.now() - 10_000),
+      },
+    },
+  });
+
+  if (recentSwipes > 15) {
+    return NextResponse.json(
+      { error: "Slow down" },
+      { status: 429 }
+    );
+  }
+
+  /* ===============================
+     BODY VALIDATION
+  =============================== */
 
   const body = await req.json();
   const parsed = swipeSchema.safeParse(body);
@@ -44,39 +97,42 @@ export async function POST(req: NextRequest) {
 
   if (fromUserId === toUserId) {
     return NextResponse.json(
-      { error: 'Cannot swipe yourself' },
+      { error: "Cannot swipe yourself" },
       { status: 400 }
     );
   }
 
-  // Verificar que el usuario actual tenga perfil completo
-  const currentUser = await prisma.user.findUnique({
-    where: { id: fromUserId },
-    select: { profileComplete: true },
-  });
+  /* ===============================
+     PROFILE CHECKS
+  =============================== */
 
-  if (!currentUser?.profileComplete) {
+  if (!dbUser.profileComplete) {
     return NextResponse.json(
-      { error: 'Complete your profile before swiping' },
+      { error: "Complete your profile before swiping" },
       { status: 403 }
     );
   }
 
-  // Verificar que el usuario objetivo exista y esté disponible
-  const target = await prisma.user.findUnique({
+  const targetUser = await prisma.user.findUnique({
     where: { id: toUserId },
-    select: { id: true, profileComplete: true },
+    select: {
+      id: true,
+      profileComplete: true,
+    },
   });
 
-  if (!target?.profileComplete) {
+  if (!targetUser?.profileComplete) {
     return NextResponse.json(
-      { error: 'Target user is not available' },
+      { error: "Target user not available" },
       { status: 404 }
     );
   }
 
-  // Verificar bloqueos en ambos sentidos
-  const existingBlock = await prisma.block.findFirst({
+  /* ===============================
+     BLOCK CHECK
+  =============================== */
+
+  const blockExists = await prisma.block.findFirst({
     where: {
       OR: [
         { blockerId: fromUserId, blockedId: toUserId },
@@ -86,36 +142,59 @@ export async function POST(req: NextRequest) {
     select: { id: true },
   });
 
-  if (existingBlock) {
+  if (blockExists) {
     return NextResponse.json(
-      { error: 'Cannot interact with this user' },
+      { error: "Cannot interact with this user" },
       { status: 403 }
     );
   }
 
-  let createdMatch = null;
+  /* ===============================
+     MAIN TRANSACTION
+  =============================== */
 
   const result = await prisma.$transaction(async (tx) => {
-    // Crear o actualizar swipe
+    /* ---------- UPSERT SWIPE ---------- */
+
     const swipe = await tx.swipe.upsert({
       where: {
-        fromUserId_toUserId: { fromUserId, toUserId },
+        fromUserId_toUserId: {
+          fromUserId,
+          toUserId,
+        },
       },
       update: { type },
-      create: { fromUserId, toUserId, type },
+      create: {
+        fromUserId,
+        toUserId,
+        type,
+      },
     });
 
-    // Solo procesar match si es LIKE
-    if (type !== 'LIKE') {
+    /* ---------- ACTIVITY SIGNAL ---------- */
+
+    if (type === "LIKE") {
+      await tx.user.update({
+        where: { id: fromUserId },
+        data: {
+          lastActiveAt: new Date(), // ⚠ requires prisma field
+        },
+      });
+    }
+
+    /* ---------- ONLY LIKE CAN MATCH ---------- */
+
+    if (type !== "LIKE") {
       return { swipe, match: null };
     }
 
-    // Verificar reciprocidad
+    /* ---------- RECIPROCAL LIKE ---------- */
+
     const reciprocalLike = await tx.swipe.findFirst({
       where: {
         fromUserId: toUserId,
         toUserId: fromUserId,
-        type: 'LIKE',
+        type: "LIKE",
       },
       select: { id: true },
     });
@@ -124,36 +203,59 @@ export async function POST(req: NextRequest) {
       return { swipe, match: null };
     }
 
-    // Ordenar IDs para evitar duplicados invertidos
+    /* ---------- DETERMINISTIC ORDER ---------- */
+
     const [user1Id, user2Id] =
       fromUserId < toUserId
         ? [fromUserId, toUserId]
         : [toUserId, fromUserId];
 
-    // Verificar si ya existe match
-    const existingMatch = await tx.match.findUnique({
+    /* ---------- UPSERT MATCH (RACE SAFE) ---------- */
+
+    const match = await tx.match.upsert({
       where: {
-        user1Id_user2Id: { user1Id, user2Id },
+        user1Id_user2Id: {
+          user1Id,
+          user2Id,
+        },
       },
-    });
-
-    if (existingMatch) {
-      return { swipe, match: existingMatch };
-    }
-
-    // Crear match
-    const match = await tx.match.create({
-      data: { user1Id, user2Id },
+      update: {},
+      create: {
+        user1Id,
+        user2Id,
+      },
+      include: {
+        user1: {
+          select: {
+            id: true,
+            name: true,
+            image: true,
+            mainField: true,
+            university: true,
+          },
+        },
+        user2: {
+          select: {
+            id: true,
+            name: true,
+            image: true,
+            mainField: true,
+            university: true,
+          },
+        },
+      },
     });
 
     return { swipe, match };
   });
 
-  createdMatch = result.match;
+  /* ===============================
+     RESPONSE
+  =============================== */
 
   return NextResponse.json({
     swipe: result.swipe,
-    match: createdMatch,
-    isMatch: !!createdMatch,
+    match: result.match,
+    isMatch: !!result.match,
   });
 }
